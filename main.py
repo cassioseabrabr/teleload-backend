@@ -36,7 +36,7 @@ LIMITE_GRATIS = 5  # usos por 24h para usuário comum
 
 # ===================== BANCO DE DADOS =====================
 
-DB_PATH = "/tmp/teleload.db"
+DB_PATH = "/data/teleload.db"
 
 def get_db():
     conn = sqlite3.connect(DB_PATH)
