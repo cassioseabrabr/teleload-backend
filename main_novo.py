@@ -173,7 +173,7 @@ async def download_file(body: DownloadRequest):
     filename = getattr(attrs.get("DocumentAttributeFilename"), "file_name",
                        f"arquivo_{msg.id}")
     async def file_stream():
-        async for chunk in client.iter_download(msg.document, chunk_size=512*1024):
+        async for chunk in client.iter_download(msg.document, chunk_size=4*1024*1024):
             yield chunk
     return StreamingResponse(file_stream(), media_type=msg.document.mime_type,
         headers={"Content-Disposition": f'attachment; filename="{filename}"'})
@@ -238,7 +238,7 @@ async def _processar_corte(job_id: str, body: CortarRequest):
         video_path = tmp_dir / fname
 
         with open(video_path, "wb") as f:
-            async for chunk in client.iter_download(msg.document, chunk_size=1024*1024):
+            async for chunk in client.iter_download(msg.document, chunk_size=4*1024*1024):
                 f.write(chunk)
 
         prog(30, "analisando")
