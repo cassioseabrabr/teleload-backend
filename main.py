@@ -30,6 +30,7 @@ API_HASH = os.environ["TELEGRAM_API_HASH"]
 pending_clients: dict = {}
 active_clients:  dict = {}
 corte_jobs:      dict = {}
+download_jobs:   dict = {}  # progresso de downloads
 
 LIMITE_GRATIS = 5  # usos por 24h para usuário comum
 
@@ -339,12 +340,41 @@ async def download_file(body: DownloadRequest):
     attrs = {type(a).__name__: a for a in msg.document.attributes}
     filename = getattr(attrs.get("DocumentAttributeFilename"), "file_name",
                        f"arquivo_{msg.id}")
+    total_size = msg.document.size
+    dl_id = str(uuid.uuid4())[:8]
+    download_jobs[dl_id] = {"baixado": 0, "total": total_size, "status": "baixando"}
     registrar_uso(body.phone)
+
     async def file_stream():
+        baixado = 0
         async for chunk in client.iter_download(msg.document, chunk_size=4*1024*1024):
+            baixado += len(chunk)
+            download_jobs[dl_id]["baixado"] = baixado
+            if baixado >= total_size:
+                download_jobs[dl_id]["status"] = "concluido"
             yield chunk
-    return StreamingResponse(file_stream(), media_type=msg.document.mime_type,
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+
+    headers = {
+        "Content-Disposition": f'attachment; filename="{filename}"',
+        "X-Download-Id": dl_id,
+        "X-File-Size": str(total_size),
+        "Access-Control-Expose-Headers": "X-Download-Id, X-File-Size",
+    }
+    return StreamingResponse(file_stream(), media_type=msg.document.mime_type, headers=headers)
+
+
+@app.get("/download/progresso/{dl_id}")
+async def progresso_download(dl_id: str):
+    job = download_jobs.get(dl_id)
+    if not job:
+        raise HTTPException(404, "Download não encontrado.")
+    pct = int((job["baixado"] / job["total"] * 100)) if job["total"] > 0 else 0
+    return {
+        "baixado": job["baixado"],
+        "total": job["total"],
+        "pct": pct,
+        "status": job["status"],
+    }
 
 
 @app.post("/cortar")
