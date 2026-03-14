@@ -169,11 +169,14 @@ FORMATOS = {
 # ===================== UTILS =====================
 
 async def get_client(session: str):
-    if session not in active_clients:
+    client = active_clients.get(session)
+    if client is None:
         client = TelegramClient(StringSession(session), API_ID, API_HASH)
         await client.connect()
         active_clients[session] = client
-    return active_clients[session]
+    elif not client.is_connected():
+        await client.connect()
+    return client
 
 def fmt_size(size: int) -> str:
     for unit in ["B", "KB", "MB", "GB"]:
