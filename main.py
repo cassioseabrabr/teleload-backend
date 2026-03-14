@@ -2,7 +2,8 @@ import os
 import asyncio
 import uuid
 import subprocess
-import shutil
+import sqlite3
+from datetime import datetime, timedelta
 from pathlib import Path
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -30,6 +31,85 @@ pending_clients: dict = {}
 active_clients:  dict = {}
 corte_jobs:      dict = {}
 
+LIMITE_GRATIS = 5  # usos por 24h para usuário comum
+
+# ===================== BANCO DE DADOS =====================
+
+DB_PATH = "/tmp/teleload.db"
+
+def get_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    conn = get_db()
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS usos (
+            phone TEXT NOT NULL,
+            timestamp TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS vip (
+            phone TEXT PRIMARY KEY,
+            expira TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS codigos (
+            codigo TEXT PRIMARY KEY,
+            usado INTEGER DEFAULT 0,
+            usado_por TEXT,
+            criado_em TEXT NOT NULL
+        );
+    """)
+    conn.commit()
+    conn.close()
+
+init_db()
+
+def is_vip(phone: str) -> bool:
+    conn = get_db()
+    row = conn.execute("SELECT expira FROM vip WHERE phone=?", (phone,)).fetchone()
+    conn.close()
+    if not row:
+        return False
+    return datetime.fromisoformat(row["expira"]) > datetime.utcnow()
+
+def get_vip_expiry(phone: str):
+    conn = get_db()
+    row = conn.execute("SELECT expira FROM vip WHERE phone=?", (phone,)).fetchone()
+    conn.close()
+    if not row:
+        return None
+    expira = datetime.fromisoformat(row["expira"])
+    if expira > datetime.utcnow():
+        return expira.strftime("%d/%m/%Y")
+    return None
+
+def contar_usos(phone: str) -> int:
+    limite = (datetime.utcnow() - timedelta(hours=24)).isoformat()
+    conn = get_db()
+    count = conn.execute(
+        "SELECT COUNT(*) as c FROM usos WHERE phone=? AND timestamp>?",
+        (phone, limite)
+    ).fetchone()["c"]
+    conn.close()
+    return count
+
+def registrar_uso(phone: str):
+    conn = get_db()
+    conn.execute("INSERT INTO usos (phone, timestamp) VALUES (?, ?)",
+                 (phone, datetime.utcnow().isoformat()))
+    conn.commit()
+    conn.close()
+
+def verificar_limite(phone: str):
+    """Lança HTTPException se usuário atingiu o limite."""
+    if is_vip(phone):
+        return  # VIP não tem limite
+    usos = contar_usos(phone)
+    if usos >= LIMITE_GRATIS:
+        raise HTTPException(403, f"LIMITE_ATINGIDO|{usos}")
+
+# ===================== MODELS =====================
 
 class SendCodeRequest(BaseModel):
     phone: str
@@ -54,13 +134,27 @@ class DownloadRequest(BaseModel):
     session: str
     channel_id: int
     message_id: int
+    phone: str
 
 class CortarRequest(BaseModel):
     session: str
     channel_id: int
     message_id: int
     formato: str = "9:16"
+    phone: str
 
+class AtivarVipRequest(BaseModel):
+    phone: str
+    codigo: str
+
+class StatusRequest(BaseModel):
+    phone: str
+
+class GerarCodigoRequest(BaseModel):
+    senha: str
+    quantidade: int = 1
+
+ADMIN_SENHA = os.environ.get("ADMIN_SENHA", "teleload2024")
 
 FORMATOS = {
     "9:16":  (608,  1080),
@@ -68,6 +162,7 @@ FORMATOS = {
     "16:9":  (1080, 608),
 }
 
+# ===================== UTILS =====================
 
 async def get_client(session: str):
     if session not in active_clients:
@@ -83,11 +178,80 @@ def fmt_size(size: int) -> str:
         size /= 1024
     return f"{size:.1f} TB"
 
+# ===================== ROTAS =====================
 
 @app.get("/")
 async def health():
     return {"status": "ok"}
 
+
+@app.post("/status")
+async def get_status(body: StatusRequest):
+    """Retorna status do usuário: usos restantes, se é VIP, quando expira."""
+    vip = is_vip(body.phone)
+    usos = contar_usos(body.phone)
+    restantes = max(0, LIMITE_GRATIS - usos) if not vip else 999
+    expira = get_vip_expiry(body.phone)
+    return {
+        "vip": vip,
+        "usos_hoje": usos,
+        "restantes": restantes,
+        "limite": LIMITE_GRATIS,
+        "expira": expira,
+    }
+
+
+@app.post("/ativar-vip")
+async def ativar_vip(body: AtivarVipRequest):
+    """Ativa VIP com código."""
+    conn = get_db()
+    row = conn.execute("SELECT * FROM codigos WHERE codigo=?", (body.codigo.upper(),)).fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(400, "Código inválido.")
+    if row["usado"]:
+        conn.close()
+        raise HTTPException(400, "Código já utilizado.")
+
+    expira = (datetime.utcnow() + timedelta(days=30)).isoformat()
+    conn.execute("UPDATE codigos SET usado=1, usado_por=? WHERE codigo=?",
+                 (body.phone, body.codigo.upper()))
+    conn.execute("INSERT OR REPLACE INTO vip (phone, expira) VALUES (?, ?)",
+                 (body.phone, expira))
+    conn.commit()
+    conn.close()
+    return {"ok": True, "expira": datetime.fromisoformat(expira).strftime("%d/%m/%Y")}
+
+
+@app.post("/admin/gerar-codigos")
+async def gerar_codigos(body: GerarCodigoRequest):
+    """Gera códigos VIP. Protegido por senha."""
+    if body.senha != ADMIN_SENHA:
+        raise HTTPException(403, "Senha incorreta.")
+    conn = get_db()
+    codigos = []
+    for _ in range(min(body.quantidade, 50)):
+        codigo = "VIP-" + uuid.uuid4().hex[:8].upper()
+        conn.execute("INSERT INTO codigos (codigo, criado_em) VALUES (?, ?)",
+                     (codigo, datetime.utcnow().isoformat()))
+        codigos.append(codigo)
+    conn.commit()
+    conn.close()
+    return {"codigos": codigos}
+
+
+@app.post("/admin/listar-codigos")
+async def listar_codigos(body: GerarCodigoRequest):
+    """Lista todos os códigos."""
+    if body.senha != ADMIN_SENHA:
+        raise HTTPException(403, "Senha incorreta.")
+    conn = get_db()
+    rows = conn.execute("SELECT * FROM codigos ORDER BY criado_em DESC").fetchall()
+    conn.close()
+    return {"codigos": [dict(r) for r in rows]}
+
+
+# ===================== AUTH =====================
 
 @app.post("/auth/send-code")
 async def send_code(body: SendCodeRequest):
@@ -134,6 +298,8 @@ async def verify_2fa(body: PasswordRequest):
                      "username": me.username}}
 
 
+# ===================== CANAIS / ARQUIVOS =====================
+
 @app.post("/channels")
 async def list_channels(body: ChannelsRequest):
     client = await get_client(body.session)
@@ -165,6 +331,7 @@ async def list_files(body: FilesRequest):
 
 @app.post("/download")
 async def download_file(body: DownloadRequest):
+    verificar_limite(body.phone)
     client = await get_client(body.session)
     msg = await client.get_messages(body.channel_id, ids=body.message_id)
     if not msg or not msg.document:
@@ -172,8 +339,9 @@ async def download_file(body: DownloadRequest):
     attrs = {type(a).__name__: a for a in msg.document.attributes}
     filename = getattr(attrs.get("DocumentAttributeFilename"), "file_name",
                        f"arquivo_{msg.id}")
+    registrar_uso(body.phone)
     async def file_stream():
-        async for chunk in client.iter_download(msg.document, chunk_size=512*1024):
+        async for chunk in client.iter_download(msg.document, chunk_size=4*1024*1024):
             yield chunk
     return StreamingResponse(file_stream(), media_type=msg.document.mime_type,
         headers={"Content-Disposition": f'attachment; filename="{filename}"'})
@@ -181,6 +349,8 @@ async def download_file(body: DownloadRequest):
 
 @app.post("/cortar")
 async def cortar_video(body: CortarRequest):
+    verificar_limite(body.phone)
+    registrar_uso(body.phone)
     job_id = str(uuid.uuid4())[:8]
     corte_jobs[job_id] = {"status": "iniciando", "progresso": 0,
                           "cenas": [], "erro": None, "log": ""}
@@ -212,6 +382,8 @@ async def baixar_cena(job_id: str, cena_idx: int):
         headers={"Content-Disposition": f'attachment; filename="{arquivo.name}"'})
 
 
+# ===================== PROCESSAMENTO DE CORTE =====================
+
 async def _processar_corte(job_id: str, body: CortarRequest):
     tmp_dir = Path(f"/tmp/corte_{job_id}")
     tmp_dir.mkdir(parents=True, exist_ok=True)
@@ -238,7 +410,7 @@ async def _processar_corte(job_id: str, body: CortarRequest):
         video_path = tmp_dir / fname
 
         with open(video_path, "wb") as f:
-            async for chunk in client.iter_download(msg.document, chunk_size=1024*1024):
+            async for chunk in client.iter_download(msg.document, chunk_size=4*1024*1024):
                 f.write(chunk)
 
         prog(30, "analisando")
