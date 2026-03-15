@@ -354,7 +354,7 @@ def process_one(video_path, bg_path, title, output_path,
         r = subprocess.run(cmd, capture_output=True, text=True,
                            encoding="utf-8", errors="replace", timeout=600)
         ok  = r.returncode == 0
-        err = r.stderr[-600:] if not ok else ""
+        err = (r.stderr + r.stdout) if not ok else ""
     except subprocess.TimeoutExpired:
         ok, err = False, "Timeout"
     except Exception as e:
