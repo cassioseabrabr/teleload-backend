@@ -690,24 +690,27 @@ async def _processar_kwai(job_id, session, channel_id, message_id,
         output_path = tmp_dir / f"kwai_{Path(fname).stem}.mp4"
         today = datetime.now().strftime("%d/%m/%y")
 
-        import concurrent.futures
+        import concurrent.futures, traceback
         loop = asyncio.get_event_loop()
-        with concurrent.futures.ThreadPoolExecutor() as pool:
-            ok, err = await loop.run_in_executor(pool, lambda: process_one(
-                video_path=video_path,
-                bg_path=str(bg_path),
-                title=titulo,
-                output_path=output_path,
-                idx=0,
-                date_str=today if nicho == "noticias" else None,
-                mirror=mirror,
-                nicho=nicho,
-                estilo=estilo,
-                cor_texto=cor_texto,
-            ))
+        try:
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                ok, err = await loop.run_in_executor(pool, lambda: process_one(
+                    video_path=video_path,
+                    bg_path=str(bg_path),
+                    title=titulo,
+                    output_path=output_path,
+                    idx=0,
+                    date_str=today if nicho == "noticias" else None,
+                    mirror=mirror,
+                    nicho=nicho,
+                    estilo=estilo,
+                    cor_texto=cor_texto,
+                ))
+        except Exception as ex:
+            raise RuntimeError(f"process_one exception: {traceback.format_exc()}")
 
         if not ok:
-            raise RuntimeError(f"FFmpeg erro: {err}")
+            raise RuntimeError(f"FFmpeg erro: {err if err else 'sem detalhes - verifique se ffmpeg esta instalado e o video é válido'}")
 
         kwai_jobs[job_id].update({
             "status": "concluido", "progresso": 100,
