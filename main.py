@@ -612,14 +612,17 @@ async def _processar_corte(job_id: str, body: CortarRequest):
 async def kwai_iniciar(
     session: str = Form(...),
     phone: str = Form(...),
-    channel_id: int = Form(...),
-    message_id: int = Form(...),
     titulo: str = Form(...),
     nicho: str = Form("noticias"),
     mirror: str = Form("true"),
     estilo: str = Form("caixa_branca"),
     cor_texto: str = Form("branco"),
+    aspecto: str = Form("4:3"),
     bg_image: UploadFile = File(...),
+    channel_id: int = Form(None),
+    message_id: int = Form(None),
+    kwai_job_id: str = Form(None),
+    cena_idx: int = Form(None),
 ):
     verificar_limite(phone)
     registrar_uso(phone)
@@ -633,9 +636,19 @@ async def kwai_iniciar(
     with open(bg_path, "wb") as f:
         f.write(await bg_image.read())
 
-    asyncio.create_task(_processar_kwai(job_id, session, channel_id, message_id,
-                                         titulo, nicho, mirror == "true", bg_path,
-                                         tmp_dir, estilo, cor_texto))
+    # Modo cena: usa vídeo já cortado
+    if kwai_job_id and cena_idx is not None:
+        cena_job = corte_jobs.get(kwai_job_id)
+        if not cena_job or cena_idx >= len(cena_job.get("cenas", [])):
+            raise HTTPException(404, "Cena não encontrada.")
+        video_path = Path(cena_job["cenas"][cena_idx]["arquivo"])
+        asyncio.create_task(_processar_kwai_direto(job_id, video_path, titulo, nicho,
+                                                    mirror == "true", bg_path, tmp_dir,
+                                                    estilo, cor_texto, aspecto))
+    else:
+        asyncio.create_task(_processar_kwai(job_id, session, channel_id, message_id,
+                                             titulo, nicho, mirror == "true", bg_path,
+                                             tmp_dir, estilo, cor_texto, aspecto))
     return {"job_id": job_id}
 
 
@@ -660,9 +673,55 @@ async def kwai_baixar(job_id: str):
         headers={"Content-Disposition": f'attachment; filename="{arquivo.name}"'})
 
 
-async def _processar_kwai(job_id, session, channel_id, message_id,
+async def _processar_kwai_direto(job_id, video_path, titulo, nicho, mirror,
+                                  bg_path, tmp_dir, estilo, cor_texto, aspecto):
+    """Processa Kwai Cut direto de uma cena já cortada — sem baixar do Telegram."""
+    def prog(p, status="", log=""):
+        kwai_jobs[job_id]["progresso"] = p
+        if status: kwai_jobs[job_id]["status"] = status
+        if log:    kwai_jobs[job_id]["log"] = log
+
+    try:
+        prog(30, "processando", f"Aplicando layout Kwai Cut na cena...")
+        from kwai_cut_formatter import process_one
+        output_path = tmp_dir / f"kwai_{Path(str(video_path)).stem}.mp4"
+        today = datetime.now().strftime("%d/%m/%y")
+
+        import concurrent.futures, traceback
+        loop = asyncio.get_event_loop()
+        try:
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                ok, err = await loop.run_in_executor(pool, lambda: process_one(
+                    video_path=video_path,
+                    bg_path=str(bg_path),
+                    title=titulo,
+                    output_path=output_path,
+                    idx=0,
+                    date_str=today if nicho == "noticias" else None,
+                    mirror=mirror,
+                    nicho=nicho,
+                    estilo=estilo,
+                    cor_texto=cor_texto,
+                    aspecto=aspecto,
+                ))
+        except Exception as ex:
+            raise RuntimeError(f"Erro: {traceback.format_exc()}")
+
+        if not ok:
+            raise RuntimeError(f"FFmpeg erro: {err}")
+
+        if not output_path.exists() or output_path.stat().st_size == 0:
+            raise RuntimeError("Arquivo de saída não foi gerado.")
+
+        kwai_jobs[job_id].update({
+            "status": "concluido", "progresso": 100,
+            "arquivo": str(output_path), "nome": output_path.name,
+            "log": "Cena Kwai pronta! ✅"
+        })
+    except Exception as e:
+        kwai_jobs[job_id].update({"status": "erro", "erro": str(e)})
                            titulo, nicho, mirror, bg_path,
-                           tmp_dir, estilo="caixa_branca", cor_texto="branco"):
+                           tmp_dir, estilo="caixa_branca", cor_texto="branco", aspecto="4:3"):
     def prog(p, status="", log=""):
         kwai_jobs[job_id]["progresso"] = p
         if status: kwai_jobs[job_id]["status"] = status
@@ -714,6 +773,7 @@ async def _processar_kwai(job_id, session, channel_id, message_id,
                     nicho=nicho,
                     estilo=estilo,
                     cor_texto=cor_texto,
+                    aspecto=aspecto,
                 ))
         except Exception as ex:
             raise RuntimeError(f"process_one exception: {traceback.format_exc()}")
