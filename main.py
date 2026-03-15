@@ -680,15 +680,24 @@ async def _processar_kwai(job_id, session, channel_id, message_id,
                         f"video_{message_id}.mp4")
         video_path = tmp_dir / fname
 
+        prog(10, "baixando", f"Baixando {fname}...")
         with open(video_path, "wb") as f:
             async for chunk in client.iter_download(msg.document, chunk_size=4*1024*1024):
                 f.write(chunk)
 
-        prog(50, "processando", "Aplicando layout Kwai Cut...")
+        if not video_path.exists() or video_path.stat().st_size == 0:
+            raise RuntimeError("Vídeo baixado está vazio ou não existe.")
 
-        from kwai_cut_formatter import process_one
+        prog(50, "processando", f"Vídeo baixado ({video_path.stat().st_size//1024//1024}MB). Aplicando layout...")
+
+        from kwai_cut_formatter import process_one, HAS_PILLOW, FONT_PATH
+        if not HAS_PILLOW:
+            raise RuntimeError("Pillow não instalado no servidor.")
+
         output_path = tmp_dir / f"kwai_{Path(fname).stem}.mp4"
         today = datetime.now().strftime("%d/%m/%y")
+
+        prog(55, "processando", f"Fonte: {FONT_PATH}. Gerando título...")
 
         import concurrent.futures, traceback
         loop = asyncio.get_event_loop()
@@ -711,6 +720,9 @@ async def _processar_kwai(job_id, session, channel_id, message_id,
 
         if not ok:
             raise RuntimeError(f"FFmpeg erro: {err if err else 'sem detalhes - verifique se ffmpeg esta instalado e o video é válido'}")
+
+        if not output_path.exists() or output_path.stat().st_size == 0:
+            raise RuntimeError("Arquivo de saída não foi gerado.")
 
         kwai_jobs[job_id].update({
             "status": "concluido", "progresso": 100,
