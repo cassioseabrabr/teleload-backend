@@ -845,6 +845,28 @@ async def _processar_kwai(job_id, session, channel_id, message_id,
             kwai_jobs[job_id].update({"status": "erro", "erro": str(e)})
 
 
+# ===================== GERADOR DE TÍTULOS =====================
+
+class GerarTitulosRequest(BaseModel):
+    nome: str
+    phone: str
+
+@app.post("/gerar-titulos")
+async def gerar_titulos(body: GerarTitulosRequest):
+    import re
+    nome = Path(body.nome).stem  # Remove extensão
+    nome = re.sub(r'[_\-\.]', ' ', nome).strip()
+    # Gera títulos baseado no nome sem precisar de IA externa
+    palavras = nome.split()[:5]
+    base = " ".join(palavras).title()
+    titulos = [
+        f"🔥 {base} - Você Precisa Ver Isso!",
+        f"😱 Incrível! {base} Surpreende a Todos",
+        f"🚨 {base} - O Que Ninguém Te Contou",
+    ]
+    return {"titulos": titulos}
+
+
 # ===================== DOWNLOAD WEB (TikTok/YouTube/Kwai) =====================
 
 class WebDownloadRequest(BaseModel):
