@@ -329,7 +329,7 @@ def process_one(video_path, bg_path, title, output_path,
         )
         extra = ["-i", titulo_img]
 
-    cmd  = [FFMPEG_EXE, "-y", "-hide_banner", "-loglevel", "error"]
+    cmd  = [FFMPEG_EXE, "-y"]
     cmd += ["-loop", "1", "-i", str(bg_path)]   # [0] fundo
     cmd += ["-i", str(video_path)]               # [1] video
     cmd += extra                                  # [2] titulo [3] data
@@ -354,7 +354,7 @@ def process_one(video_path, bg_path, title, output_path,
         r = subprocess.run(cmd, capture_output=True, text=True,
                            encoding="utf-8", errors="replace", timeout=600)
         ok  = r.returncode == 0
-        err = (r.stderr + r.stdout) if not ok else ""
+        err = (r.stderr[-1200:] + "\nSTDOUT:" + r.stdout[-400:]) if not ok else ""
     except subprocess.TimeoutExpired:
         ok, err = False, "Timeout"
     except Exception as e:
