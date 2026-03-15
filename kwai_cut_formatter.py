@@ -33,8 +33,8 @@ DATE_FONT    = 36
 DATE_MARGIN  = 20              # distancia abaixo do video
 
 # ── Codec ────────────────────────────────────────────────────────────────────
-CODEC_PRESET = "fast"
-CRF          = "20"
+CODEC_PRESET = "ultrafast"
+CRF          = "23"
 PROFILE      = "high"
 LEVEL        = "4.1"
 PIX_FMT      = "yuv420p"
@@ -230,31 +230,21 @@ FADE_OUT = 0.5
 
 # ── Filtro de video ───────────────────────────────────────────────────────────
 def build_video_filter(idx, mirror, duration=60.0, vid_w=None, vid_h=None):
-    """Fingerprint: cor, nitidez, grain, velocidade, fade, mirror. Scale seguro sem zoom."""
+    """Filtro simplificado para servidor — sem grain/noise pesados."""
     color = COLOR_PRESETS[idx % len(COLOR_PRESETS)]
-    sharp = SHARP_PRESETS[idx % len(SHARP_PRESETS)]
     speed = SPEED_PRESETS[idx % len(SPEED_PRESETS)]
 
     w = vid_w if vid_w else VID_W
     h = vid_h if vid_h else VID_H
 
-    fade_out_start = max(0.5, duration * speed - FADE_OUT - 0.1)
-
     F = []
     if speed != 1.0:
         F.append(f"setpts={1.0/speed:.4f}*PTS")
-    # Zoom 5%: garante que nao sobra borda, crop centralizado
-    zw = int(w * 1.30); zw = zw if zw%2==0 else zw+1
-    zh = int(h * 1.30); zh = zh if zh%2==0 else zh+1
-    F.append(f"scale={zw}:{zh}:flags=lanczos:force_original_aspect_ratio=increase")
+    F.append(f"scale={w}:{h}:force_original_aspect_ratio=increase:flags=fast_bilinear")
     F.append(f"crop={w}:{h}")
     F.append(f"eq=brightness={color['brightness']:.3f}:contrast={color['contrast']:.3f}:saturation={color['saturation']:.3f}")
-    F.append(f"unsharp=luma_msize_x={sharp[0]}:luma_msize_y={sharp[1]}:luma_amount={sharp[2]}")
-    F.append(f"noise=alls={GRAIN_STRENGTH}:allf=t+u")
     if mirror:
         F.append("hflip")
-    F.append(f"fade=t=in:st=0:d={FADE_IN}")
-    F.append(f"fade=t=out:st={fade_out_start:.2f}:d={FADE_OUT}")
     return ",".join(F)
 
 # ── Processa um video ─────────────────────────────────────────────────────────
