@@ -3,6 +3,8 @@ import asyncio
 import uuid
 import subprocess
 import sqlite3
+import gc
+import shutil
 from datetime import datetime, timedelta
 from pathlib import Path
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
@@ -32,6 +34,9 @@ active_clients:  dict = {}
 corte_jobs:      dict = {}
 download_jobs:   dict = {}
 kwai_jobs:       dict = {}
+
+# Semáforo: só 1 job pesado por vez (evita Out of Memory)
+_processing_sem = asyncio.Semaphore(1)
 
 LIMITE_GRATIS = 5  # usos por 24h para usuário comum
 
@@ -433,177 +438,192 @@ async def _processar_corte(job_id: str, body: CortarRequest):
     def log(msg):
         corte_jobs[job_id]["log"] = msg
 
-    try:
-        prog(5, "baixando")
-        log("Baixando vídeo do Telegram...")
-        client = await get_client(body.session)
-        msg = await client.get_messages(body.channel_id, ids=body.message_id)
-        if not msg or not msg.document:
-            raise RuntimeError("Arquivo não encontrado.")
-
-        attrs = {type(a).__name__: a for a in msg.document.attributes}
-        fname = getattr(attrs.get("DocumentAttributeFilename"), "file_name",
-                        f"video_{body.message_id}.mp4")
-        video_path = tmp_dir / fname
-
-        with open(video_path, "wb") as f:
-            async for chunk in client.iter_download(msg.document, chunk_size=4*1024*1024):
-                f.write(chunk)
-
-        prog(30, "analisando")
-        log("Extraindo áudio para análise...")
-
-        wav_path = tmp_dir / "audio.wav"
-        subprocess.run([
-            "ffmpeg", "-y", "-i", str(video_path),
-            "-vn", "-acodec", "pcm_s16le", "-ar", "22050", "-ac", "1",
-            str(wav_path)
-        ], capture_output=True, check=True)
-
-        r = subprocess.run(["ffmpeg", "-i", str(video_path)],
-                           capture_output=True, text=True)
-        import re
-        m = re.search(r"Duration: (\d+):(\d+):(\d+\.?\d*)", r.stderr)
-        duracao = (int(m.group(1))*3600 + int(m.group(2))*60 +
-                   float(m.group(3))) if m else 0.0
-
-        prog(40, "analisando")
-        log("Analisando padrões de áudio com IA...")
-
-        import numpy as np
-        import librosa
-
-        y, sr = librosa.load(str(wav_path), sr=22050, mono=True)
-        hop = int(sr * 0.25)
-        frame_len = int(sr * 0.5)
-
-        rms   = librosa.feature.rms(y=y, frame_length=frame_len, hop_length=hop)[0]
-        rms_n = (rms - rms.min()) / (rms.max() - rms.min() + 1e-9)
-
+    async with _processing_sem:  # Só 1 job pesado por vez
         try:
-            f0, _, _ = librosa.pyin(y, fmin=80, fmax=400,
-                                     frame_length=frame_len, hop_length=hop)
-            pitch    = np.nan_to_num(f0, nan=0.0)
-            pitch_n  = (pitch - pitch.min()) / (pitch.max() - pitch.min() + 1e-9)
-            pitch_var = np.clip(np.abs(np.diff(pitch_n, prepend=pitch_n[0]))*3, 0, 1)
-        except Exception:
+            prog(5, "baixando")
+            log("Baixando vídeo do Telegram...")
+            client = await get_client(body.session)
+            msg = await client.get_messages(body.channel_id, ids=body.message_id)
+            if not msg or not msg.document:
+                raise RuntimeError("Arquivo não encontrado.")
+
+            attrs = {type(a).__name__: a for a in msg.document.attributes}
+            fname = getattr(attrs.get("DocumentAttributeFilename"), "file_name",
+                            f"video_{body.message_id}.mp4")
+            video_path = tmp_dir / fname
+
+            with open(video_path, "wb") as f:
+                async for chunk in client.iter_download(msg.document, chunk_size=4*1024*1024):
+                    f.write(chunk)
+
+            prog(30, "analisando")
+            log("Extraindo áudio para análise...")
+
+            # Usa SR menor (11025) para economizar memória
+            wav_path = tmp_dir / "audio.wav"
+            subprocess.run([
+                "ffmpeg", "-y", "-i", str(video_path),
+                "-vn", "-acodec", "pcm_s16le", "-ar", "11025", "-ac", "1",
+                str(wav_path)
+            ], capture_output=True, check=True)
+
+            r = subprocess.run(["ffmpeg", "-i", str(video_path)],
+                               capture_output=True, text=True)
+            import re
+            m = re.search(r"Duration: (\d+):(\d+):(\d+\.?\d*)", r.stderr)
+            duracao = (int(m.group(1))*3600 + int(m.group(2))*60 +
+                       float(m.group(3))) if m else 0.0
+
+            prog(40, "analisando")
+            log("Analisando padrões de áudio com IA...")
+
+            import numpy as np
+            import librosa
+
+            # SR 11025 usa metade da memória vs 22050
+            sr_load = 11025
+            y, sr = librosa.load(str(wav_path), sr=sr_load, mono=True)
+            hop = int(sr * 0.5)   # hop maior = menos frames = menos RAM
+            frame_len = int(sr * 1.0)
+
+            rms   = librosa.feature.rms(y=y, frame_length=frame_len, hop_length=hop)[0]
+            rms_n = (rms - rms.min()) / (rms.max() - rms.min() + 1e-9)
+
+            # Pula pyin (muito pesado) — usa só RMS e onset
             pitch_var = np.zeros(len(rms_n))
 
-        onset   = librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop)
-        onset_n = (onset - onset.min()) / (onset.max() - onset.min() + 1e-9)
+            onset   = librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop)
+            onset_n = (onset - onset.min()) / (onset.max() - onset.min() + 1e-9)
 
-        min_len   = min(len(rms_n), len(pitch_var), len(onset_n))
-        rms_n     = rms_n[:min_len]
-        pitch_var = pitch_var[:min_len]
-        onset_n   = onset_n[:min_len]
+            # Libera memória do áudio
+            del y
+            gc.collect()
 
-        silencio      = rms_n < 0.15
-        bonus         = np.zeros(min_len)
-        for i in range(4, min_len):
-            if silencio[i-4:i].any() and rms_n[i] > 0.6:
-                bonus[max(0, i-2):i+8] = 0.4
+            min_len   = min(len(rms_n), len(onset_n))
+            rms_n     = rms_n[:min_len]
+            pitch_var = pitch_var[:min_len]
+            onset_n   = onset_n[:min_len]
 
-        score = rms_n*0.40 + pitch_var*0.25 + onset_n*0.25 + bonus*0.10
-        score = np.convolve(score, np.ones(8)/8, mode='same')
-        score = (score - score.min()) / (score.max() - score.min() + 1e-9)
-        times = librosa.frames_to_time(range(min_len), sr=sr, hop_length=hop)
+            silencio      = rms_n < 0.15
+            bonus         = np.zeros(min_len)
+            for i in range(4, min_len):
+                if silencio[i-4:i].any() and rms_n[i] > 0.6:
+                    bonus[max(0, i-2):i+8] = 0.4
 
-        threshold = np.percentile(score, 65 if duracao>=1800 else 55 if duracao>=600 else 45)
-        ativo     = score >= threshold
+            score = rms_n*0.50 + onset_n*0.40 + bonus*0.10
+            score = np.convolve(score, np.ones(4)/4, mode='same')
+            score = (score - score.min()) / (score.max() - score.min() + 1e-9)
+            times = librosa.frames_to_time(range(min_len), sr=sr, hop_length=hop)
 
-        prog(60, "detectando cenas")
-        log("Detectando melhores cenas...")
+            # Libera mais memória
+            del rms_n, pitch_var, onset_n, onset, rms
+            gc.collect()
 
-        segmentos = []
-        em_cena   = False
-        inicio    = 0.0
-        for t, a in zip(times, ativo):
-            if a and not em_cena:
-                em_cena = True; inicio = max(0, t - 2.0)
-            elif not a and em_cena:
-                em_cena = False
-                fim = min(t + 3.0, duracao)
-                if fim - inicio >= 5.0:
-                    segmentos.append((inicio, fim))
-        if em_cena:
-            segmentos.append((inicio, min(times[-1]+3.0, duracao)))
+            threshold = np.percentile(score, 65 if duracao>=1800 else 55 if duracao>=600 else 45)
+            ativo     = score >= threshold
 
-        merged = []
-        for seg in segmentos:
-            if merged and seg[0] - merged[-1][1] < 8.0:
-                merged[-1] = (merged[-1][0], seg[1])
-            else:
-                merged.append(list(seg))
+            prog(60, "detectando cenas")
+            log("Detectando melhores cenas...")
 
-        expandidas = []
-        for ini, fim in merged:
-            dur = fim - ini
-            if dur < 60.0:
-                falta = 60.0 - dur
-                ini = max(0, ini - falta/2)
-                fim = min(duracao, fim + falta/2)
-            if fim - ini > 180.0:
-                fim = ini + 180.0
-            expandidas.append((ini, fim))
+            segmentos = []
+            em_cena   = False
+            inicio    = 0.0
+            for t, a in zip(times, ativo):
+                if a and not em_cena:
+                    em_cena = True; inicio = max(0, t - 2.0)
+                elif not a and em_cena:
+                    em_cena = False
+                    fim = min(t + 3.0, duracao)
+                    if fim - inicio >= 5.0:
+                        segmentos.append((inicio, fim))
+            if em_cena:
+                segmentos.append((inicio, min(times[-1]+3.0, duracao)))
 
-        scored = []
-        for ini, fim in expandidas:
-            i_ini = max(0, int(ini/0.25))
-            i_fim = min(len(score)-1, int(fim/0.25))
-            sc    = float(np.mean(score[i_ini:i_fim+1]))
-            scored.append((ini, fim, sc))
-        scored.sort(key=lambda x: -x[2])
+            merged = []
+            for seg in segmentos:
+                if merged and seg[0] - merged[-1][1] < 8.0:
+                    merged[-1] = (merged[-1][0], seg[1])
+                else:
+                    merged.append(list(seg))
 
-        selecionados = []
-        dur_total    = 0.0
-        for ini, fim, _ in scored:
-            d = fim - ini
-            if dur_total + d <= 900:
-                selecionados.append((ini, fim))
-                dur_total += d
-            if len(selecionados) >= 8:
-                break
-        selecionados.sort(key=lambda x: x[0])
+            expandidas = []
+            for ini, fim in merged:
+                dur = fim - ini
+                if dur < 60.0:
+                    falta = 60.0 - dur
+                    ini = max(0, ini - falta/2)
+                    fim = min(duracao, fim + falta/2)
+                if fim - ini > 180.0:
+                    fim = ini + 180.0
+                expandidas.append((ini, fim))
 
-        prog(70, "cortando")
-        log(f"Cortando {len(selecionados)} cenas...")
+            scored = []
+            for ini, fim in expandidas:
+                i_ini = max(0, int(ini/0.5))
+                i_fim = min(len(score)-1, int(fim/0.5))
+                sc    = float(np.mean(score[i_ini:i_fim+1]))
+                scored.append((ini, fim, sc))
+            scored.sort(key=lambda x: -x[2])
 
-        w, h  = FORMATOS.get(body.formato, FORMATOS["9:16"])
-        vf    = (f"scale={w}:{h}:force_original_aspect_ratio=increase,"
-                 f"crop={w}:{h},setsar=1")
-        pasta = tmp_dir / "cenas"
-        pasta.mkdir(exist_ok=True)
-        nome  = Path(fname).stem[:30]
-        cenas_info = []
+            # Libera score da memória
+            del score, times
+            gc.collect()
 
-        for i, (ini, fim) in enumerate(selecionados, 1):
-            arq = pasta / f"{nome}_cena{i:02d}.mp4"
-            subprocess.run([
-                "ffmpeg", "-y", "-fflags", "+discardcorrupt+genpts",
-                "-ss", str(ini), "-i", str(video_path),
-                "-t", str(fim-ini), "-vf", vf,
-                "-c:v", "libx264", "-preset", "fast", "-crf", "23",
-                "-c:a", "aac", "-b:a", "128k",
-                "-movflags", "+faststart", str(arq)
-            ], capture_output=True)
-            if arq.exists() and arq.stat().st_size > 1000:
-                cenas_info.append({
-                    "arquivo": str(arq), "nome": arq.name,
-                    "inicio": f"{int(ini//60)}m{int(ini%60):02d}s",
-                    "fim":    f"{int(fim//60)}m{int(fim%60):02d}s",
-                    "duracao": f"{int(fim-ini)}s",
-                })
-            prog(70 + int((i/len(selecionados))*28), "cortando")
+            selecionados = []
+            dur_total    = 0.0
+            for ini, fim, _ in scored:
+                d = fim - ini
+                if dur_total + d <= 900:
+                    selecionados.append((ini, fim))
+                    dur_total += d
+                if len(selecionados) >= 8:
+                    break
+            selecionados.sort(key=lambda x: x[0])
 
-        corte_jobs[job_id].update({
-            "cenas": cenas_info, "status": "concluido", "progresso": 100
-        })
-        log(f"{len(cenas_info)} cenas prontas!")
-        video_path.unlink(missing_ok=True)
-        wav_path.unlink(missing_ok=True)
+            # Apaga WAV antes de cortar (libera espaço em disco)
+            wav_path.unlink(missing_ok=True)
 
-    except Exception as e:
-        corte_jobs[job_id].update({"status": "erro", "erro": str(e)})
+            prog(70, "cortando")
+            log(f"Cortando {len(selecionados)} cenas...")
+
+            w, h  = FORMATOS.get(body.formato, FORMATOS["9:16"])
+            vf    = (f"scale={w}:{h}:force_original_aspect_ratio=increase,"
+                     f"crop={w}:{h},setsar=1")
+            pasta = tmp_dir / "cenas"
+            pasta.mkdir(exist_ok=True)
+            nome  = Path(fname).stem[:30]
+            cenas_info = []
+
+            for i, (ini, fim) in enumerate(selecionados, 1):
+                arq = pasta / f"{nome}_cena{i:02d}.mp4"
+                subprocess.run([
+                    "ffmpeg", "-y", "-fflags", "+discardcorrupt+genpts",
+                    "-ss", str(ini), "-i", str(video_path),
+                    "-t", str(fim-ini), "-vf", vf,
+                    "-c:v", "libx264", "-preset", "fast", "-crf", "23",
+                    "-c:a", "aac", "-b:a", "128k",
+                    "-movflags", "+faststart", str(arq)
+                ], capture_output=True)
+                if arq.exists() and arq.stat().st_size > 1000:
+                    cenas_info.append({
+                        "arquivo": str(arq), "nome": arq.name,
+                        "inicio": f"{int(ini//60)}m{int(ini%60):02d}s",
+                        "fim":    f"{int(fim//60)}m{int(fim%60):02d}s",
+                        "duracao": f"{int(fim-ini)}s",
+                    })
+                prog(70 + int((i/len(selecionados))*28), "cortando")
+
+            # Apaga vídeo original (mantém só as cenas)
+            video_path.unlink(missing_ok=True)
+            gc.collect()
+
+            corte_jobs[job_id].update({
+                "cenas": cenas_info, "status": "concluido", "progresso": 100
+            })
+            log(f"{len(cenas_info)} cenas prontas!")
+
+        except Exception as e:
+            corte_jobs[job_id].update({"status": "erro", "erro": str(e)})
 
 
 # ===================== KWAI CUT =====================
@@ -623,6 +643,7 @@ async def kwai_iniciar(
     message_id: int = Form(None),
     kwai_job_id: str = Form(None),
     cena_idx: int = Form(None),
+    video_upload: UploadFile = File(None),
 ):
     verificar_limite(phone)
     registrar_uso(phone)
@@ -636,8 +657,8 @@ async def kwai_iniciar(
     with open(bg_path, "wb") as f:
         f.write(await bg_image.read())
 
-    # Modo cena: usa vídeo já cortado
     if kwai_job_id and cena_idx is not None:
+        # Modo cena cortada
         cena_job = corte_jobs.get(kwai_job_id)
         if not cena_job or cena_idx >= len(cena_job.get("cenas", [])):
             raise HTTPException(404, "Cena não encontrada.")
@@ -645,7 +666,17 @@ async def kwai_iniciar(
         asyncio.create_task(_processar_kwai_direto(job_id, video_path, titulo, nicho,
                                                     mirror == "true", bg_path, tmp_dir,
                                                     estilo, cor_texto, aspecto))
+    elif video_upload:
+        # Modo galeria — salva o vídeo enviado
+        ext = Path(video_upload.filename).suffix or ".mp4"
+        video_path = tmp_dir / f"upload{ext}"
+        with open(video_path, "wb") as f:
+            f.write(await video_upload.read())
+        asyncio.create_task(_processar_kwai_direto(job_id, video_path, titulo, nicho,
+                                                    mirror == "true", bg_path, tmp_dir,
+                                                    estilo, cor_texto, aspecto))
     else:
+        # Modo Telegram
         asyncio.create_task(_processar_kwai(job_id, session, channel_id, message_id,
                                              titulo, nicho, mirror == "true", bg_path,
                                              tmp_dir, estilo, cor_texto, aspecto))
@@ -681,45 +712,53 @@ async def _processar_kwai_direto(job_id, video_path, titulo, nicho, mirror,
         if status: kwai_jobs[job_id]["status"] = status
         if log:    kwai_jobs[job_id]["log"] = log
 
-    try:
-        prog(30, "processando", f"Aplicando layout Kwai Cut na cena...")
-        from kwai_cut_formatter import process_one
-        output_path = tmp_dir / f"kwai_{Path(str(video_path)).stem}.mp4"
-        today = datetime.now().strftime("%d/%m/%y")
-
-        import concurrent.futures, traceback
-        loop = asyncio.get_event_loop()
+    async with _processing_sem:
         try:
-            with concurrent.futures.ThreadPoolExecutor() as pool:
-                ok, err = await loop.run_in_executor(pool, lambda: process_one(
-                    video_path=video_path,
-                    bg_path=str(bg_path),
-                    title=titulo,
-                    output_path=output_path,
-                    idx=0,
-                    date_str=today if nicho == "noticias" else None,
-                    mirror=mirror,
-                    nicho=nicho,
-                    estilo=estilo,
-                    cor_texto=cor_texto,
-                    aspecto=aspecto,
-                ))
-        except Exception as ex:
-            raise RuntimeError(f"Erro: {traceback.format_exc()}")
+            prog(30, "processando", f"Aplicando layout Kwai Cut na cena...")
+            from kwai_cut_formatter import process_one
+            output_path = tmp_dir / f"kwai_{Path(str(video_path)).stem}.mp4"
+            today = datetime.now().strftime("%d/%m/%y")
 
-        if not ok:
-            raise RuntimeError(f"FFmpeg erro: {err}")
+            import concurrent.futures, traceback
+            loop = asyncio.get_event_loop()
+            try:
+                with concurrent.futures.ThreadPoolExecutor() as pool:
+                    ok, err = await loop.run_in_executor(pool, lambda: process_one(
+                        video_path=video_path,
+                        bg_path=str(bg_path),
+                        title=titulo,
+                        output_path=output_path,
+                        idx=0,
+                        date_str=today if nicho == "noticias" else None,
+                        mirror=mirror,
+                        nicho=nicho,
+                        estilo=estilo,
+                        cor_texto=cor_texto,
+                        aspecto=aspecto,
+                    ))
+            except Exception as ex:
+                raise RuntimeError(f"Erro: {traceback.format_exc()}")
 
-        if not output_path.exists() or output_path.stat().st_size == 0:
-            raise RuntimeError("Arquivo de saída não foi gerado.")
+            if not ok:
+                raise RuntimeError(f"FFmpeg erro: {err}")
 
-        kwai_jobs[job_id].update({
-            "status": "concluido", "progresso": 100,
-            "arquivo": str(output_path), "nome": output_path.name,
-            "log": "Cena Kwai pronta! ✅"
-        })
-    except Exception as e:
-        kwai_jobs[job_id].update({"status": "erro", "erro": str(e)})
+            if not output_path.exists() or output_path.stat().st_size == 0:
+                raise RuntimeError("Arquivo de saída não foi gerado.")
+
+            # Limpa arquivos temporários
+            try:
+                bg_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            gc.collect()
+
+            kwai_jobs[job_id].update({
+                "status": "concluido", "progresso": 100,
+                "arquivo": str(output_path), "nome": output_path.name,
+                "log": "Cena Kwai pronta! ✅"
+            })
+        except Exception as e:
+            kwai_jobs[job_id].update({"status": "erro", "erro": str(e)})
 
 
 async def _processar_kwai(job_id, session, channel_id, message_id,
@@ -730,72 +769,177 @@ async def _processar_kwai(job_id, session, channel_id, message_id,
         if status: kwai_jobs[job_id]["status"] = status
         if log:    kwai_jobs[job_id]["log"] = log
 
-    try:
-        prog(5, "baixando", "Baixando vídeo do Telegram...")
-        client = await get_client(session)
-        msg = await client.get_messages(channel_id, ids=message_id)
-        if not msg or not msg.document:
-            raise RuntimeError("Arquivo não encontrado.")
-
-        attrs = {type(a).__name__: a for a in msg.document.attributes}
-        fname = getattr(attrs.get("DocumentAttributeFilename"), "file_name",
-                        f"video_{message_id}.mp4")
-        video_path = tmp_dir / fname
-
-        prog(10, "baixando", f"Baixando {fname}...")
-        with open(video_path, "wb") as f:
-            async for chunk in client.iter_download(msg.document, chunk_size=4*1024*1024):
-                f.write(chunk)
-
-        if not video_path.exists() or video_path.stat().st_size == 0:
-            raise RuntimeError("Vídeo baixado está vazio ou não existe.")
-
-        prog(50, "processando", f"Vídeo baixado ({video_path.stat().st_size//1024//1024}MB). Aplicando layout...")
-
-        from kwai_cut_formatter import process_one, HAS_PILLOW, FONT_PATH
-        if not HAS_PILLOW:
-            raise RuntimeError("Pillow não instalado no servidor.")
-
-        output_path = tmp_dir / f"kwai_{Path(fname).stem}.mp4"
-        today = datetime.now().strftime("%d/%m/%y")
-
-        prog(55, "processando", f"Fonte: {FONT_PATH}. Gerando título...")
-
-        import concurrent.futures, traceback
-        loop = asyncio.get_event_loop()
+    async with _processing_sem:
         try:
+            prog(5, "baixando", "Baixando vídeo do Telegram...")
+            client = await get_client(session)
+            msg = await client.get_messages(channel_id, ids=message_id)
+            if not msg or not msg.document:
+                raise RuntimeError("Arquivo não encontrado.")
+
+            attrs = {type(a).__name__: a for a in msg.document.attributes}
+            fname = getattr(attrs.get("DocumentAttributeFilename"), "file_name",
+                            f"video_{message_id}.mp4")
+            video_path = tmp_dir / fname
+
+            prog(10, "baixando", f"Baixando {fname}...")
+            with open(video_path, "wb") as f:
+                async for chunk in client.iter_download(msg.document, chunk_size=4*1024*1024):
+                    f.write(chunk)
+
+            if not video_path.exists() or video_path.stat().st_size == 0:
+                raise RuntimeError("Vídeo baixado está vazio ou não existe.")
+
+            prog(50, "processando", f"Vídeo baixado ({video_path.stat().st_size//1024//1024}MB). Aplicando layout...")
+
+            from kwai_cut_formatter import process_one, HAS_PILLOW, FONT_PATH
+            if not HAS_PILLOW:
+                raise RuntimeError("Pillow não instalado no servidor.")
+
+            output_path = tmp_dir / f"kwai_{Path(fname).stem}.mp4"
+            today = datetime.now().strftime("%d/%m/%y")
+
+            prog(55, "processando", f"Fonte: {FONT_PATH}. Gerando título...")
+
+            import concurrent.futures, traceback
+            loop = asyncio.get_event_loop()
+            try:
+                with concurrent.futures.ThreadPoolExecutor() as pool:
+                    ok, err = await loop.run_in_executor(pool, lambda: process_one(
+                        video_path=video_path,
+                        bg_path=str(bg_path),
+                        title=titulo,
+                        output_path=output_path,
+                        idx=0,
+                        date_str=today if nicho == "noticias" else None,
+                        mirror=mirror,
+                        nicho=nicho,
+                        estilo=estilo,
+                        cor_texto=cor_texto,
+                        aspecto=aspecto,
+                    ))
+            except Exception as ex:
+                raise RuntimeError(f"process_one exception: {traceback.format_exc()}")
+
+            if not ok:
+                raise RuntimeError(f"FFmpeg erro: {err if err else 'sem detalhes'}")
+
+            if not output_path.exists() or output_path.stat().st_size == 0:
+                raise RuntimeError("Arquivo de saída não foi gerado.")
+
+            # Limpa arquivos originais para liberar memória
+            video_path.unlink(missing_ok=True)
+            try:
+                bg_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            gc.collect()
+
+            kwai_jobs[job_id].update({
+                "status": "concluido", "progresso": 100,
+                "arquivo": str(output_path), "nome": output_path.name,
+                "log": "Vídeo Kwai pronto! ✅"
+            })
+
+        except Exception as e:
+            kwai_jobs[job_id].update({"status": "erro", "erro": str(e)})
+
+
+# ===================== DOWNLOAD WEB (TikTok/YouTube/Kwai) =====================
+
+class WebDownloadRequest(BaseModel):
+    url: str
+    phone: str
+
+web_jobs: dict = {}
+
+@app.post("/webdl/iniciar")
+async def webdl_iniciar(body: WebDownloadRequest):
+    verificar_limite(body.phone)
+    registrar_uso(body.phone)
+    job_id = str(uuid.uuid4())[:8]
+    web_jobs[job_id] = {"status": "iniciando", "progresso": 0, "erro": None, "log": ""}
+    asyncio.create_task(_processar_webdl(job_id, body.url))
+    return {"job_id": job_id}
+
+@app.get("/webdl/status/{job_id}")
+async def webdl_status(job_id: str):
+    job = web_jobs.get(job_id)
+    if not job:
+        raise HTTPException(404, "Job não encontrado.")
+    return job
+
+@app.get("/webdl/baixar/{job_id}")
+async def webdl_baixar(job_id: str):
+    job = web_jobs.get(job_id)
+    if not job or job["status"] != "concluido":
+        raise HTTPException(404, "Vídeo não disponível.")
+    arquivo = Path(job["arquivo"])
+    if not arquivo.exists():
+        raise HTTPException(404, "Arquivo não encontrado.")
+    return FileResponse(str(arquivo), media_type="video/mp4",
+        filename=arquivo.name,
+        headers={"Content-Disposition": f'attachment; filename="{arquivo.name}"'})
+
+async def _processar_webdl(job_id: str, url: str):
+    tmp_dir = Path(f"/tmp/webdl_{job_id}")
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+
+    def prog(p, status="", log=""):
+        web_jobs[job_id]["progresso"] = p
+        if status: web_jobs[job_id]["status"] = status
+        if log:    web_jobs[job_id]["log"] = log
+
+    async with _processing_sem:
+        try:
+            prog(10, "baixando", "Iniciando download...")
+
+            import concurrent.futures
+            loop = asyncio.get_event_loop()
+
+            def do_download():
+                import yt_dlp
+                output_template = str(tmp_dir / "%(title).40s.%(ext)s")
+                ydl_opts = {
+                    "outtmpl": output_template,
+                    "format": "bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]/best[ext=mp4][height<=720]/best",
+                    "merge_output_format": "mp4",
+                    "noplaylist": True,
+                    "quiet": True,
+                    "no_warnings": True,
+                }
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(url, download=True)
+                    title = info.get("title", "video")[:40]
+                    ext   = info.get("ext", "mp4")
+                    # Encontra o arquivo baixado
+                    files = list(tmp_dir.glob("*.mp4"))
+                    if not files:
+                        files = list(tmp_dir.glob(f"*{ext}"))
+                    return files[0] if files else None, title
+
+            prog(20, "baixando", "Baixando vídeo...")
             with concurrent.futures.ThreadPoolExecutor() as pool:
-                ok, err = await loop.run_in_executor(pool, lambda: process_one(
-                    video_path=video_path,
-                    bg_path=str(bg_path),
-                    title=titulo,
-                    output_path=output_path,
-                    idx=0,
-                    date_str=today if nicho == "noticias" else None,
-                    mirror=mirror,
-                    nicho=nicho,
-                    estilo=estilo,
-                    cor_texto=cor_texto,
-                    aspecto=aspecto,
-                ))
-        except Exception as ex:
-            raise RuntimeError(f"process_one exception: {traceback.format_exc()}")
+                arquivo, titulo = await loop.run_in_executor(pool, do_download)
 
-        if not ok:
-            raise RuntimeError(f"FFmpeg erro: {err if err else 'sem detalhes - verifique se ffmpeg esta instalado e o video é válido'}")
+            if not arquivo or not arquivo.exists():
+                raise RuntimeError("Não foi possível baixar o vídeo.")
 
-        if not output_path.exists() or output_path.stat().st_size == 0:
-            raise RuntimeError("Arquivo de saída não foi gerado.")
+            prog(100, "concluido", f"✅ {titulo}")
+            web_jobs[job_id].update({
+                "status": "concluido", "progresso": 100,
+                "arquivo": str(arquivo), "nome": arquivo.name,
+                "titulo": titulo, "log": f"{titulo}"
+            })
+            gc.collect()
 
-        kwai_jobs[job_id].update({
-            "status": "concluido", "progresso": 100,
-            "arquivo": str(output_path), "nome": output_path.name,
-            "log": "Vídeo Kwai pronto! ✅"
-        })
-        video_path.unlink(missing_ok=True)
-
-    except Exception as e:
-        kwai_jobs[job_id].update({"status": "erro", "erro": str(e)})
+        except Exception as e:
+            err = str(e)
+            if "not available" in err or "private" in err.lower():
+                err = "Vídeo privado ou não disponível."
+            elif "unsupported" in err.lower():
+                err = "Site não suportado."
+            web_jobs[job_id].update({"status": "erro", "erro": err})
 
 
 if __name__ == "__main__":
