@@ -83,23 +83,25 @@ FFPROBE_EXE = _resolve_exe("ffprobe")
 # ── Fonte ────────────────────────────────────────────────────────────────────
 def _find_font():
     import glob
+    # Linux system fonts (Railway/Docker)
+    for path in [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+        "/usr/share/fonts/truetype/ubuntu/Ubuntu-B.ttf",
+    ]:
+        if os.path.isfile(path):
+            return path
+    # Windows fonts fallback
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    for name in ["Montserrat-Bold.ttf", "MontserratBold.ttf", "Montserrat_Bold.ttf", "Montserrat-VariableFont_wght.ttf", "Montserrat-Italic-VariableFont_wght.ttf", "arialbd.ttf", "arial.ttf", "calibrib.ttf", "calibri.ttf"]:
+    for name in ["Montserrat-Bold.ttf", "MontserratBold.ttf", "arialbd.ttf", "arial.ttf"]:
         p = os.path.join(script_dir, "fonts", name)
         if os.path.isfile(p):
             return p
-    for f in glob.glob(os.path.join(script_dir, "*.ttf")):
-        return f
-    for name in ["arialbd.ttf", "arial.ttf", "calibrib.ttf", "verdana.ttf"]:
+    for name in ["arialbd.ttf", "arial.ttf", "calibrib.ttf"]:
         p = os.path.join(r"C:\Windows\Fonts", name)
         if os.path.isfile(p):
             return p
-    try:
-        fs = glob.glob(r"C:\Windows\Fonts\*.ttf")
-        if fs:
-            return fs[0]
-    except Exception:
-        pass
     return None
 
 FONT_PATH = _find_font()
@@ -262,9 +264,10 @@ def process_one(video_path, bg_path, title, output_path,
     if not date_str:
         date_str = datetime.now().strftime("%d/%m/%y")
 
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    titulo_img = os.path.join(script_dir, f"_titulo_tmp_{idx}.png")
-    data_img   = os.path.join(script_dir, f"_data_tmp_{idx}.png")
+    import tempfile
+    tmp_dir = tempfile.gettempdir()
+    titulo_img = os.path.join(tmp_dir, f"_titulo_tmp_{idx}.png")
+    data_img   = os.path.join(tmp_dir, f"_data_tmp_{idx}.png")
 
     ok_titulo, titulo_h = gerar_titulo_img(title, titulo_img, nicho=nicho,
                                             estilo=estilo, cor_texto=cor_texto)
