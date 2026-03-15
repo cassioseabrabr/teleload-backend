@@ -5,7 +5,7 @@ import subprocess
 import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, FileResponse
 from pydantic import BaseModel
@@ -30,7 +30,8 @@ API_HASH = os.environ["TELEGRAM_API_HASH"]
 pending_clients: dict = {}
 active_clients:  dict = {}
 corte_jobs:      dict = {}
-download_jobs:   dict = {}  # progresso de downloads
+download_jobs:   dict = {}
+kwai_jobs:       dict = {}
 
 LIMITE_GRATIS = 5  # usos por 24h para usuário comum
 
@@ -603,6 +604,120 @@ async def _processar_corte(job_id: str, body: CortarRequest):
 
     except Exception as e:
         corte_jobs[job_id].update({"status": "erro", "erro": str(e)})
+
+
+# ===================== KWAI CUT =====================
+
+@app.post("/kwai/iniciar")
+async def kwai_iniciar(
+    session: str = Form(...),
+    phone: str = Form(...),
+    channel_id: int = Form(...),
+    message_id: int = Form(...),
+    titulo: str = Form(...),
+    nicho: str = Form("noticias"),
+    mirror: str = Form("true"),
+    estilo: str = Form("caixa_branca"),
+    cor_texto: str = Form("branco"),
+    bg_image: UploadFile = File(...),
+):
+    verificar_limite(phone)
+    registrar_uso(phone)
+
+    job_id = str(uuid.uuid4())[:8]
+    kwai_jobs[job_id] = {"status": "iniciando", "progresso": 0, "erro": None, "log": ""}
+
+    tmp_dir = Path(f"/tmp/kwai_{job_id}")
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    bg_path = tmp_dir / "bg.jpg"
+    with open(bg_path, "wb") as f:
+        f.write(await bg_image.read())
+
+    asyncio.create_task(_processar_kwai(job_id, session, channel_id, message_id,
+                                         titulo, nicho, mirror == "true", bg_path,
+                                         tmp_dir, estilo, cor_texto))
+    return {"job_id": job_id}
+
+
+@app.get("/kwai/status/{job_id}")
+async def kwai_status(job_id: str):
+    job = kwai_jobs.get(job_id)
+    if not job:
+        raise HTTPException(404, "Job não encontrado.")
+    return job
+
+
+@app.get("/kwai/baixar/{job_id}")
+async def kwai_baixar(job_id: str):
+    job = kwai_jobs.get(job_id)
+    if not job or job["status"] != "concluido":
+        raise HTTPException(404, "Vídeo não disponível.")
+    arquivo = Path(job["arquivo"])
+    if not arquivo.exists():
+        raise HTTPException(404, "Arquivo não encontrado.")
+    return FileResponse(str(arquivo), media_type="video/mp4",
+        filename=arquivo.name,
+        headers={"Content-Disposition": f'attachment; filename="{arquivo.name}"'})
+
+
+async def _processar_kwai(job_id, session, channel_id, message_id,
+                           titulo, nicho, mirror, bg_path,
+                           tmp_dir, estilo="caixa_branca", cor_texto="branco"):
+    def prog(p, status="", log=""):
+        kwai_jobs[job_id]["progresso"] = p
+        if status: kwai_jobs[job_id]["status"] = status
+        if log:    kwai_jobs[job_id]["log"] = log
+
+    try:
+        prog(5, "baixando", "Baixando vídeo do Telegram...")
+        client = await get_client(session)
+        msg = await client.get_messages(channel_id, ids=message_id)
+        if not msg or not msg.document:
+            raise RuntimeError("Arquivo não encontrado.")
+
+        attrs = {type(a).__name__: a for a in msg.document.attributes}
+        fname = getattr(attrs.get("DocumentAttributeFilename"), "file_name",
+                        f"video_{message_id}.mp4")
+        video_path = tmp_dir / fname
+
+        with open(video_path, "wb") as f:
+            async for chunk in client.iter_download(msg.document, chunk_size=4*1024*1024):
+                f.write(chunk)
+
+        prog(50, "processando", "Aplicando layout Kwai Cut...")
+
+        from kwai_cut_formatter import process_one
+        output_path = tmp_dir / f"kwai_{Path(fname).stem}.mp4"
+        today = datetime.now().strftime("%d/%m/%y")
+
+        import concurrent.futures
+        loop = asyncio.get_event_loop()
+        with concurrent.futures.ThreadPoolExecutor() as pool:
+            ok, err = await loop.run_in_executor(pool, lambda: process_one(
+                video_path=video_path,
+                bg_path=str(bg_path),
+                title=titulo,
+                output_path=output_path,
+                idx=0,
+                date_str=today if nicho == "noticias" else None,
+                mirror=mirror,
+                nicho=nicho,
+                estilo=estilo,
+                cor_texto=cor_texto,
+            ))
+
+        if not ok:
+            raise RuntimeError(f"FFmpeg erro: {err}")
+
+        kwai_jobs[job_id].update({
+            "status": "concluido", "progresso": 100,
+            "arquivo": str(output_path), "nome": output_path.name,
+            "log": "Vídeo Kwai pronto! ✅"
+        })
+        video_path.unlink(missing_ok=True)
+
+    except Exception as e:
+        kwai_jobs[job_id].update({"status": "erro", "erro": str(e)})
 
 
 if __name__ == "__main__":
