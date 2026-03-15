@@ -250,7 +250,8 @@ def build_video_filter(idx, mirror, duration=60.0, vid_w=None, vid_h=None):
 # ── Processa um video ─────────────────────────────────────────────────────────
 def process_one(video_path, bg_path, title, output_path,
                 idx=0, logo_path=None, date_str=None, mirror=True,
-                nicho="noticias", estilo="caixa_branca", cor_texto="branco"):
+                nicho="noticias", estilo="caixa_branca", cor_texto="branco",
+                aspecto="4:3"):
     if not date_str:
         date_str = datetime.now().strftime("%d/%m/%y")
 
@@ -266,42 +267,40 @@ def process_one(video_path, bg_path, title, output_path,
     if not ok_titulo:
         return False, "Pillow nao disponivel. Instale: pip install Pillow"
 
-    # ── Dimensoes por nicho ────────────────────────────────────────────────
-    if nicho == "musica":
-        # 1:1 — quadrado centralizado
-        vid_w = OUT_W           # 720
-        vid_h = OUT_W           # 720  (1:1)
-        vid_x = 0
-    else:
-        # 4:3 — padrao noticias
-        vid_w = VID_W           # 720
-        vid_h = VID_H           # 540  (4:3)
-        vid_x = VID_X           # 0
+    # ── Dimensoes por aspecto ──────────────────────────────────────────────
+    if aspecto == "1:1":
+        vid_w = OUT_W        # 720
+        vid_h = OUT_W        # 720
+    else:  # 4:3 padrão
+        vid_w = OUT_W        # 720
+        vid_h = int(OUT_W * 3 / 4)  # 540
 
-    # Video: CENTRALIZADO verticalmente (igual ao CapCut)
+    vid_x = 0
     vid_y = (OUT_H - vid_h) // 2
 
     # Titulo: centralizado na area ACIMA do video
     titulo_y = max(TITLE_MARGIN, (vid_y - titulo_h) // 2)
 
-    # Data: logo abaixo do video (so noticias)
+    # Data: logo abaixo do video
     data_y = vid_y + vid_h + DATE_MARGIN
 
-    # ── Duracao (deve vir antes do filtro) ───────────────────────────────────
+    # ── Duracao ───────────────────────────────────────────────────────────
     duration = get_duration(video_path)
     atempo   = ATEMPO_VALUES[idx % len(ATEMPO_VALUES)]
     speed    = SPEED_PRESETS[idx % len(SPEED_PRESETS)]
     audio_eq = AUDIO_EQ_PRESETS[idx % len(AUDIO_EQ_PRESETS)]
 
-    # ── Filtro ───────────────────────────────────────────────────────────────
+    # ── Filtro ────────────────────────────────────────────────────────────
     vf = build_video_filter(idx, mirror, duration=duration, vid_w=vid_w, vid_h=vid_h)
 
+    # Fundo: escala para cobrir TODO o 9:16 sem bordas pretas
+    bg_filter = (f"scale={OUT_W}:{OUT_H}:force_original_aspect_ratio=increase,"
+                 f"crop={OUT_W}:{OUT_H}")
+
     # inputs: [0]=fundo  [1]=video  [2]=titulo  [3]=data
-    if ok_data and nicho == "noticias":
-        # Noticias: com data
+    if ok_data:
         filtro = (
-            f"[0:v]scale={OUT_W}:{OUT_H}:force_original_aspect_ratio=increase,"
-            f"crop={OUT_W}:{OUT_H}[bg];"
+            f"[0:v]{bg_filter}[bg];"
             f"[1:v]{vf}[vid];"
             f"[bg][vid]overlay={vid_x}:{vid_y}[t1];"
             f"[t1][2:v]overlay=(W-w)/2:{titulo_y}[t2];"
@@ -309,10 +308,8 @@ def process_one(video_path, bg_path, title, output_path,
         )
         extra = ["-i", titulo_img, "-i", data_img]
     else:
-        # Musica ou sem data
         filtro = (
-            f"[0:v]scale={OUT_W}:{OUT_H}:force_original_aspect_ratio=increase,"
-            f"crop={OUT_W}:{OUT_H}[bg];"
+            f"[0:v]{bg_filter}[bg];"
             f"[1:v]{vf}[vid];"
             f"[bg][vid]overlay={vid_x}:{vid_y}[t1];"
             f"[t1][2:v]overlay=(W-w)/2:{titulo_y}[outv]"
@@ -320,9 +317,9 @@ def process_one(video_path, bg_path, title, output_path,
         extra = ["-i", titulo_img]
 
     cmd  = [FFMPEG_EXE, "-y"]
-    cmd += ["-loop", "1", "-t", str(duration), "-i", str(bg_path)]  # [0] fundo com duração fixa
-    cmd += ["-i", str(video_path)]               # [1] video
-    cmd += extra                                  # [2] titulo [3] data
+    cmd += ["-loop", "1", "-t", str(duration), "-i", str(bg_path)]
+    cmd += ["-i", str(video_path)]
+    cmd += extra
     cmd += ["-filter_complex", filtro, "-map", "[outv]", "-map", "1:a?"]
     af_parts = []
     if speed != 1.0:
@@ -355,8 +352,6 @@ def process_one(video_path, bg_path, title, output_path,
             except Exception:
                 pass
     return ok, err
-
-
 def main():
     import argparse
     p = argparse.ArgumentParser()
