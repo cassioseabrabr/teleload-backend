@@ -330,11 +330,10 @@ def process_one(video_path, bg_path, title, output_path,
         extra = ["-i", titulo_img]
 
     cmd  = [FFMPEG_EXE, "-y"]
-    cmd += ["-loop", "1", "-i", str(bg_path)]   # [0] fundo
+    cmd += ["-loop", "1", "-t", str(duration), "-i", str(bg_path)]  # [0] fundo com duração fixa
     cmd += ["-i", str(video_path)]               # [1] video
     cmd += extra                                  # [2] titulo [3] data
     cmd += ["-filter_complex", filtro, "-map", "[outv]", "-map", "1:a?"]
-    # Audio: atempo (velocidade) + EQ (equalização sutil)
     af_parts = []
     if speed != 1.0:
         af_parts.append(f"atempo={atempo}")
@@ -347,7 +346,7 @@ def process_one(video_path, bg_path, title, output_path,
         "-movflags", "+faststart",
         "-c:a", "aac", "-b:a", AUDIO_BR, "-ar", AUDIO_SR, "-ac", "2",
         "-map_metadata", "-1", "-map_chapters", "-1",
-        "-shortest", "-t", str(duration), str(output_path)
+        "-t", str(duration), str(output_path)
     ]
 
     try:
