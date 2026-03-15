@@ -720,6 +720,9 @@ async def _processar_kwai_direto(job_id, video_path, titulo, nicho, mirror,
         })
     except Exception as e:
         kwai_jobs[job_id].update({"status": "erro", "erro": str(e)})
+
+
+async def _processar_kwai(job_id, session, channel_id, message_id,
                            titulo, nicho, mirror, bg_path,
                            tmp_dir, estilo="caixa_branca", cor_texto="branco", aspecto="4:3"):
     def prog(p, status="", log=""):
